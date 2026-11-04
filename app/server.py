@@ -106,13 +106,12 @@ MANAGER = DownloadManager(DATA_DIR, SETTINGS)
 
 def versions() -> dict:
     out = {"python": "%d.%d.%d" % sys.version_info[:3]}
-    out["curl"] = transport.curl_path()
     try:
-        proc = subprocess.run([transport.curl_path(), "--version"],
-                              capture_output=True, text=True, timeout=10)
-        out["curl_version"] = (proc.stdout or "").splitlines()[0].strip()
+        import requests
+
+        out["requests"] = requests.__version__
     except Exception:
-        out["curl_version"] = "未知"
+        out["requests"] = "未知"
     out["endpoint"] = hf_client.endpoint()
     out["proxy"] = SETTINGS.get("proxy") or "未设置"
     return out
@@ -358,7 +357,8 @@ def test_endpoint(url: str, proxy: str = "") -> dict:
     ok, cost, message = transport.ping(url, proxy)
     if ok:
         return {"ok": True, "latency": cost, "message": message}
-    return {"ok": False, "error": hf_client.explain_error(RuntimeError(message))}
+    # ping 返回的已经是面向用户的说明，不要再套一层「模型不存在」之类的翻译
+    return {"ok": False, "error": message}
 
 
 # ---------------------------------------------------------------------------

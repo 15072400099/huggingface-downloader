@@ -148,11 +148,28 @@ def download_to(url: str, part: Path, expect: int, proxy: str | None = None,
 def ping(url: str, proxy: str | None = None, timeout: int = 20) -> tuple[bool, int, str]:
     """探测服务地址是否可用，返回 (ok, 毫秒, 说明)。"""
     started = time.time()
+    url = (url or "").strip().rstrip("/")
+    # 必须打到 /api/models：站点根路径返回的是 HTML 首页，不是 JSON
+    api = url if url.endswith("/api/models") else f"{url}/api/models"
     try:
-        data = get_json(url, {"search": "qwen", "limit": 1}, timeout=timeout, proxy=proxy)
+        data = get_json(api, {"search": "qwen", "limit": 1}, timeout=timeout, proxy=proxy)
         cost = int((time.time() - started) * 1000)
         if not isinstance(data, list):
             return False, cost, "这个地址返回的不是模型列表，可能不是 HuggingFace 镜像"
         return True, cost, f"连接正常（{cost} 毫秒）"
     except BaseException as exc:  # noqa: BLE001
-        return False, int((time.time() - started) * 1000), str(exc)[:200]
+        message = str(exc)
+        low = message.lower()
+        if "http 404" in low:
+            message = "这个地址没有 /api/models 接口，不像是 HuggingFace 镜像"
+        elif "http 5" in low:
+            message = "镜像服务器返回错误（5xx），稍后再试"
+        elif "不是 json" in message or "doctype" in low or "<html" in low:
+            message = "这个地址返回的是网页而不是模型数据，不像是 HuggingFace 镜像"
+        elif "resolve host" in low or "could not resolve" in low:
+            message = "域名解析失败，检查地址拼写"
+        elif "timed out" in low or "timeout" in low:
+            message = "连接超时，检查网络或代理设置"
+        elif "connection refused" in low or "connection reset" in low:
+            message = "连接被拒绝或重置，检查网络或代理设置"
+        return False, int((time.time() - started) * 1000), message[:200]
