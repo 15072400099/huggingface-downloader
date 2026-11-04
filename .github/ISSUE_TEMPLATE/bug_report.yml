@@ -1,0 +1,67 @@
+name: 报告问题
+description: 连不上、下载失败、卡住不动、文件缺失等
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。填得越具体，定位越快。
+
+        如果是**连不上**，请先看设置页的「测试连接」结果；
+        如果是**文件不齐**，先跑一次 `检查并补齐模型.bat`。
+
+  - type: dropdown
+    id: how
+    attributes:
+      label: 你是用哪种方式运行的？
+      options:
+        - 下载的 exe（HFModelDownloader.exe）
+        - 源码方式（批处理启动）
+        - 直接从 Python 运行
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 发生了什么？
+      description: 期望的结果 vs 实际的结果
+      placeholder: 搜索框输入 llama 后一直转圈，最后提示 TLS 握手失败……
+    validations:
+      required: true
+
+  - type: textarea
+    id: how-to-reproduce
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 用默认服务地址 hf-mirror.com
+        2. 搜索 llama
+        3. 点「看文件」后等 30 秒
+
+  - type: input
+    id: endpoint
+    attributes:
+      label: 用的服务地址 / 代理
+      description: 设置页里显示的那个
+      placeholder: https://hf-mirror.com（或自填的地址 + 代理）
+
+  - type: input
+    id: model
+    attributes:
+      label: 涉及的模型
+      placeholder: 作者/模型名
+
+  - type: textarea
+    id: log
+    attributes:
+      label: 日志或报错原文
+      description: 界面上的红色提示，或 data\logs\server.log 的最后几十行
+      render: text
+
+  - type: input
+    id: env
+    attributes:
+      label: 系统与版本
+      placeholder: Windows 11 23H2 / v1.0.0

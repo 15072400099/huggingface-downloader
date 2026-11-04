@@ -1,0 +1,25 @@
+# 运行时生成的东西
+models/
+data/
+python/
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# 临时
+*.log
+*.tmp
+*.incomplete

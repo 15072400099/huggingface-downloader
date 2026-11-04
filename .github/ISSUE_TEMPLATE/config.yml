@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 使用说明 / 常见问题
+    url: https://github.com/15072400099/huggingface-downloader#readme
+    about: 先看 README 的「故障排查」和「速度与限制」，很多问题那里有答案
+  - name: 国内访问 HuggingFace 的镜像说明
+    url: https://hf-mirror.com
+    about: 默认走 hf-mirror.com；镜像本身可用性请以该站点为准

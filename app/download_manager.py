@@ -1,0 +1,635 @@
+"""下载任务管理：队列、并发、进度、速度和断点续传。
+
+与魔搭版的区别：这里不使用任何第三方下载库，
+整个下载过程就是「HTTP Range + 追加写入」，行为完全可预期：
+* 暂停 = 中断连接，保留 .incomplete 半截文件
+* 继续 = 从半截文件的长度接着请求
+* 取消 = 中断并删除半截文件
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+import transport
+
+import hf_client
+
+INCOMPLETE_SUFFIX = ".incomplete"
+META_NAME = ".download-meta.json"
+MAX_ATTEMPTS = 6
+
+STATUS_TEXT = {
+    "queued": "排队中",
+    "running": "下载中",
+    "pausing": "正在暂停",
+    "paused": "已暂停",
+    "canceling": "正在取消",
+    "canceled": "已取消",
+    "done": "已完成",
+    "error": "出错",
+}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _safe_dir_name(name: str) -> str:
+    cleaned = "".join(ch for ch in name if ch not in '\\/:*?"<>|').strip()
+    return cleaned or "model"
+
+
+def download_file_to(url: str, target: Path, expect: int, *, proxy: str | None = None,
+                     event: threading.Event | None = None, on_progress=None,
+                     attempts: int = MAX_ATTEMPTS) -> bool:
+    """把 url 下载到 target：支持断点续传、暂停、失败重试。
+
+    这是整个程序唯一的下载实现，界面任务和「补齐缺失文件」脚本共用它。
+    返回 True 表示文件已完整落地；被暂停时返回 False。
+    """
+    part = Path(str(target) + INCOMPLETE_SUFFIX)
+    part.parent.mkdir(parents=True, exist_ok=True)
+    last_error: BaseException | None = None
+
+    for attempt in range(1, attempts + 1):
+        if event is not None and event.is_set():
+            return False
+        have = part.stat().st_size if part.exists() else 0
+        if expect and have >= expect:
+            break
+        try:
+            result = transport.download_to(url, part, expect, proxy=proxy,
+                                           event=event, on_progress=on_progress)
+            if result == "canceled":
+                return False
+            if result == "restart":
+                # 服务端不支持断点，已删除半截文件，下一轮整份重下
+                continue
+            last_error = None
+            break
+        except BaseException as exc:  # noqa: BLE001
+            last_error = exc
+            if event is not None and event.is_set():
+                return False
+            time.sleep(min(30, 2 ** attempt))
+
+    size = part.stat().st_size if part.exists() else 0
+    if expect and size < expect:
+        raise last_error or RuntimeError(f"只下到 {size}/{expect} 字节")
+    part.replace(target)
+    return True
+
+
+class DownloadManager:
+    def __init__(self, data_dir: Path, settings: dict):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.tasks_path = self.data_dir / "tasks.json"
+        self.settings = settings
+
+        self._lock = threading.RLock()
+        self._tasks: list[dict] = []
+        self._events: dict[str, threading.Event] = {}
+        self._threads: dict[str, threading.Thread] = {}
+        self._dirty = False
+        self._library_cache: tuple[float, list] | None = None
+
+        self._load()
+        threading.Thread(target=self._tick_loop, name="scheduler", daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 持久化
+    # ------------------------------------------------------------------
+    def _load(self) -> None:
+        if not self.tasks_path.exists():
+            return
+        try:
+            raw = json.loads(self.tasks_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        with self._lock:
+            for item in raw if isinstance(raw, list) else []:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                if item.get("status") in ("running", "pausing", "canceling"):
+                    item["status"] = "paused"
+                item["speed"] = 0
+                item.setdefault("files", [])
+                item.setdefault("bytes_done", 0)
+                item.setdefault("error", None)
+                self._tasks.append(item)
+        for item in self._tasks:
+            if item.get("status") != "done":
+                self._refresh_progress_from_disk(item)
+
+    def _mark_dirty(self) -> None:
+        self._dirty = True
+
+    def _refresh_progress_from_disk(self, task: dict) -> None:
+        files = task.get("files") or []
+        if not files or not task.get("local_dir"):
+            return
+        out_dir = Path(task["local_dir"])
+        done_bytes = 0
+        done_files = 0
+        for item in files:
+            size = int(item.get("size") or 0)
+            target = out_dir / item["path"]
+            part = Path(str(target) + INCOMPLETE_SUFFIX)
+            try:
+                if target.exists():
+                    actual = target.stat().st_size
+                    if size <= 0 or actual == size:
+                        item["state"] = "done"
+                        done_bytes += actual
+                        done_files += 1
+                        continue
+                if part.exists():
+                    item["state"] = "partial"
+                    done_bytes += part.stat().st_size
+                    continue
+            except OSError:
+                continue
+            if item.get("state") == "done":
+                item["state"] = "pending"
+        task["bytes_done"] = done_bytes
+        task["files_done"] = done_files
+
+    def _save(self, force: bool = False) -> None:
+        with self._lock:
+            if not (self._dirty or force):
+                return
+            self._dirty = False
+            payload = [{k: v for k, v in t.items() if not k.startswith("_") and k != "speed"}
+                       for t in self._tasks]
+            text = json.dumps(payload, ensure_ascii=False, indent=1)
+        tmp = self.tasks_path.with_suffix(".json.tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(self.tasks_path)
+
+    def save_now(self) -> None:
+        self._save(force=True)
+
+    # ------------------------------------------------------------------
+    # 调度
+    # ------------------------------------------------------------------
+    def _tick_loop(self) -> None:
+        last_save = time.monotonic()
+        while True:
+            time.sleep(1.0)
+            try:
+                self._sample_speeds()
+                self._schedule()
+                if time.monotonic() - last_save >= 3:
+                    self._save()
+                    last_save = time.monotonic()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _sample_speeds(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            for task in self._tasks:
+                if task.get("status") == "running":
+                    last_t = task.get("_lt") or now
+                    last_b = task.get("_lb") or 0
+                    dt = now - last_t
+                    if dt >= 0.8:
+                        delta = max(0, task.get("bytes_done", 0) - last_b)
+                        task["speed"] = delta / dt if dt else 0
+                        task["_lt"] = now
+                        task["_lb"] = task.get("bytes_done", 0)
+                else:
+                    task["speed"] = 0
+                    task["_lt"] = now
+                    task["_lb"] = task.get("bytes_done", 0)
+
+    def _schedule(self) -> None:
+        limit = max(1, int(self.settings.get("max_parallel_models", 2)))
+        with self._lock:
+            running = sum(1 for t in self._tasks
+                          if t.get("status") in ("running", "pausing", "canceling"))
+            if running >= limit:
+                return
+            for task in self._tasks:
+                if running >= limit:
+                    break
+                if task.get("status") != "queued":
+                    continue
+                if task["id"] in self._threads and self._threads[task["id"]].is_alive():
+                    continue
+                self._start_task(task)
+                running += 1
+
+    def _start_task(self, task: dict) -> None:
+        event = threading.Event()
+        self._events[task["id"]] = event
+        task["status"] = "running"
+        task["error"] = None
+        task["_lt"] = time.monotonic()
+        task["_lb"] = task.get("bytes_done", 0)
+        thread = threading.Thread(target=self._run_task, args=(task, event),
+                                  name=f"task-{task['id'][:8]}", daemon=True)
+        self._threads[task["id"]] = thread
+        thread.start()
+        self._mark_dirty()
+
+    # ------------------------------------------------------------------
+    # 下载
+    # ------------------------------------------------------------------
+    def _run_task(self, task: dict, event: threading.Event) -> None:
+        try:
+            out_dir = Path(task["local_dir"])
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            files = task.get("files") or []
+            if not files:
+                listing = hf_client.list_files(task["repo_id"], task.get("revision") or "main")
+                if listing.get("error"):
+                    raise RuntimeError(listing["error"])
+                files = [{"path": f["path"], "size": f["size"], "state": "pending"}
+                         for f in listing["files"]]
+                task["files"] = files
+                task["total_files"] = len(files)
+                task["bytes_total"] = sum(int(f["size"]) for f in files)
+
+            pending: list[dict] = []
+            done_bytes = 0
+            for item in files:
+                if item.get("state") == "done":
+                    done_bytes += int(item.get("size") or 0)
+                    continue
+                target = out_dir / item["path"]
+                part = Path(str(target) + INCOMPLETE_SUFFIX)
+                size = int(item.get("size") or 0)
+                if target.exists():
+                    try:
+                        actual = target.stat().st_size
+                    except OSError:
+                        actual = -1
+                    if size <= 0 or actual == size:
+                        item["state"] = "done"
+                        done_bytes += max(actual, 0)
+                        continue
+                if part.exists():
+                    try:
+                        done_bytes += part.stat().st_size
+                        item["state"] = "partial"
+                    except OSError:
+                        pass
+                pending.append(item)
+
+            with self._lock:
+                task["bytes_done"] = done_bytes
+                task["_lb"] = done_bytes
+                task["_lt"] = time.monotonic()
+                task["files_done"] = sum(1 for f in files if f.get("state") == "done")
+            self._mark_dirty()
+
+            failures: list[tuple[str, str]] = []
+            workers = max(1, int(self.settings.get("files_per_model", 3)))
+
+            if pending:
+                with ThreadPoolExecutor(max_workers=min(workers, len(pending))) as pool:
+                    futures = {pool.submit(self._download_one, task, event, out_dir, item): item
+                               for item in pending}
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            future.result()
+                        except BaseException as exc:  # noqa: BLE001
+                            if event.is_set():
+                                continue
+                            failures.append((item["path"], hf_client.explain_error(exc)))
+                            with self._lock:
+                                item["state"] = "error"
+                        if event.is_set():
+                            for f in futures:
+                                f.cancel()
+
+            with self._lock:
+                status = task.get("status")
+                if event.is_set():
+                    if status == "canceling":
+                        task["status"] = "canceled"
+                    elif status == "pausing":
+                        task["status"] = "paused"
+                elif failures:
+                    task["status"] = "error"
+                    first = failures[0]
+                    task["error"] = f"{len(failures)} 个文件下载失败，例如 {first[0]}：{first[1]}"
+                else:
+                    task["status"] = "done"
+                    task["bytes_done"] = task.get("bytes_total") or task.get("bytes_done", 0)
+                    task["files_done"] = len(files)
+                task["updated_at"] = _now()
+                task.pop("_lt", None)
+                task.pop("_lb", None)
+            self._mark_dirty()
+
+            if task["status"] == "done":
+                self._write_meta(task, out_dir)
+            elif task["status"] == "canceled":
+                self._remove_partials(out_dir)
+        except BaseException as exc:  # noqa: BLE001
+            with self._lock:
+                if event.is_set():
+                    if task.get("status") == "canceling":
+                        task["status"] = "canceled"
+                    elif task.get("status") == "pausing":
+                        task["status"] = "paused"
+                else:
+                    task["status"] = "error"
+                    task["error"] = hf_client.explain_error(exc)
+                task["updated_at"] = _now()
+            self._mark_dirty()
+        finally:
+            self._events.pop(task["id"], None)
+
+    def _download_one(self, task: dict, event: threading.Event, out_dir: Path, item: dict) -> None:
+        path = item["path"]
+        expect = int(item.get("size") or 0)
+        target = out_dir / path
+
+        with self._lock:
+            item["state"] = "downloading"
+
+        url = hf_client.file_url(task["repo_id"], task.get("revision") or "main", path)
+
+        def on_progress(delta: int) -> None:
+            with self._lock:
+                total = task.get("bytes_total") or 0
+                value = task.get("bytes_done", 0) + int(delta)
+                task["bytes_done"] = max(0, min(value, total)) if total else max(0, value)
+
+        download_file_to(url, target, expect, proxy=hf_client.proxy(),
+                         event=event, on_progress=on_progress)
+
+        with self._lock:
+            if target.exists():
+                item["state"] = "done"
+            task["files_done"] = sum(1 for f in task.get("files", []) if f.get("state") == "done")
+
+    # ------------------------------------------------------------------
+    # 任务操作
+    # ------------------------------------------------------------------
+    def add_task(self, repo_id: str, revision: str = "main",
+                 files: list[dict] | None = None, display_name: str = "") -> dict:
+        repo_id = hf_client.normalize_repo_id(repo_id)
+        if not repo_id:
+            raise ValueError("模型 ID 不对，应该形如 Qwen/Qwen2.5-7B-Instruct")
+        revision = (revision or "main").strip() or "main"
+
+        owner, _, name = repo_id.partition("/")
+        root = Path(self.settings["download_dir"])
+        local_dir = root / _safe_dir_name(owner) / _safe_dir_name(name)
+
+        with self._lock:
+            for existing in self._tasks:
+                if (existing["repo_id"] == repo_id and existing.get("revision") == revision
+                        and existing.get("status") in ("queued", "running", "paused", "pausing")):
+                    return existing
+
+        task = {
+            "id": uuid.uuid4().hex,
+            "repo_id": repo_id,
+            "revision": revision,
+            "display_name": display_name or name,
+            "local_dir": str(local_dir),
+            "endpoint": hf_client.endpoint(),
+            "status": "queued",
+            "error": None,
+            "created_at": _now(),
+            "updated_at": _now(),
+            "total_files": len(files or []),
+            "files_done": 0,
+            "bytes_total": sum(int(f.get("size") or 0) for f in (files or [])),
+            "bytes_done": 0,
+            "speed": 0,
+            "files": [{"path": f["path"], "size": int(f.get("size") or 0), "state": "pending"}
+                      for f in (files or [])],
+        }
+        with self._lock:
+            self._tasks.insert(0, task)
+        self._mark_dirty()
+        return task
+
+    def _find(self, task_id: str) -> dict:
+        for task in self._tasks:
+            if task["id"] == task_id:
+                return task
+        raise KeyError("任务不存在")
+
+    def pause(self, task_id: str) -> dict:
+        with self._lock:
+            task = self._find(task_id)
+            if task["status"] == "queued":
+                task["status"] = "paused"
+            elif task["status"] == "running":
+                task["status"] = "pausing"
+                event = self._events.get(task_id)
+                if event:
+                    event.set()
+            task["updated_at"] = _now()
+        self._mark_dirty()
+        return task
+
+    def resume(self, task_id: str) -> dict:
+        with self._lock:
+            task = self._find(task_id)
+            if task["status"] in ("error", "canceled", "done"):
+                task["error"] = None
+            if task["status"] == "done":
+                return task
+            if task["status"] in ("queued", "running"):
+                return task
+            task["status"] = "queued"
+            task["updated_at"] = _now()
+        self._mark_dirty()
+        return task
+
+    def cancel(self, task_id: str) -> dict:
+        with self._lock:
+            task = self._find(task_id)
+            if task["status"] in ("running", "pausing"):
+                task["status"] = "canceling"
+                event = self._events.get(task_id)
+                if event:
+                    event.set()
+            else:
+                task["status"] = "canceled"
+                self._remove_partials(Path(task["local_dir"]))
+            task["updated_at"] = _now()
+        self._mark_dirty()
+        return task
+
+    def retry(self, task_id: str) -> dict:
+        with self._lock:
+            task = self._find(task_id)
+            for item in task.get("files", []):
+                if item.get("state") in ("error", "downloading"):
+                    item["state"] = "pending"
+            task["error"] = None
+            task["status"] = "queued"
+            task["updated_at"] = _now()
+        self._mark_dirty()
+        return task
+
+    def remove(self, task_id: str, delete_files: bool = False) -> None:
+        with self._lock:
+            task = self._find(task_id)
+            event = self._events.get(task_id)
+            if event:
+                event.set()
+            if task["status"] in ("running", "pausing", "queued"):
+                task["status"] = "canceling"
+            self._tasks = [t for t in self._tasks if t["id"] != task_id]
+        if task.get("local_dir") and delete_files:
+            target = Path(task["local_dir"])
+            root = Path(self.settings["download_dir"]).resolve()
+            try:
+                resolved = target.resolve()
+                if str(resolved).lower().startswith(str(root).lower()) and resolved != root:
+                    shutil.rmtree(resolved, ignore_errors=True)
+            except OSError:
+                pass
+        self._mark_dirty()
+        self._library_cache = None
+
+    # ------------------------------------------------------------------
+    # 辅助
+    # ------------------------------------------------------------------
+    def _write_meta(self, task: dict, out_dir: Path) -> None:
+        try:
+            meta = {
+                "repo_id": task["repo_id"],
+                "revision": task.get("revision") or "main",
+                "endpoint": task.get("endpoint") or hf_client.endpoint(),
+                "files": len(task.get("files") or []),
+                "size": int(task.get("bytes_total") or 0),
+                "finished_at": _now(),
+            }
+            (out_dir / META_NAME).write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                                             encoding="utf-8")
+        except OSError:
+            pass
+
+    def _remove_partials(self, out_dir: Path) -> None:
+        try:
+            if not out_dir.exists():
+                return
+            for path in out_dir.rglob(f"*{INCOMPLETE_SUFFIX}"):
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def state(self) -> dict:
+        with self._lock:
+            tasks = []
+            for task in self._tasks:
+                item = {k: v for k, v in task.items() if not k.startswith("_")}
+                total = int(item.get("bytes_total") or 0)
+                done = int(item.get("bytes_done") or 0)
+                speed = float(item.get("speed") or 0)
+                item["percent"] = round(done / total * 100, 1) if total else 0.0
+                item["speed"] = round(speed, 1)
+                item["eta"] = int((total - done) / speed) if speed > 0 and total > done else 0
+                item["status_text"] = STATUS_TEXT.get(item.get("status", ""), item.get("status", ""))
+                tasks.append(item)
+            running = sum(1 for t in tasks if t["status"] in ("running", "pausing", "canceling"))
+            queued = sum(1 for t in tasks if t["status"] == "queued")
+            return {"tasks": tasks, "running": running, "queued": queued, "total": len(tasks)}
+
+    # ------------------------------------------------------------------
+    # 本地模型库
+    # ------------------------------------------------------------------
+    def library(self, force: bool = False) -> dict:
+        now = time.monotonic()
+        if self._library_cache and not force and now - self._library_cache[0] < 5:
+            cached = self._library_cache[1]
+            return {"items": cached, "total_size": sum(i["size"] for i in cached)}
+
+        root = Path(self.settings["download_dir"])
+        items = []
+        if root.exists():
+            for owner_dir in [p for p in root.iterdir() if p.is_dir()]:
+                try:
+                    models = [p for p in owner_dir.iterdir() if p.is_dir()]
+                except OSError:
+                    continue
+                for model_dir in models:
+                    entry = self._describe_dir(model_dir)
+                    if entry:
+                        entry["owner"] = owner_dir.name
+                        if not entry.get("repo_id"):
+                            entry["repo_id"] = f"{owner_dir.name}/{model_dir.name}"
+                        items.append(entry)
+        items.sort(key=lambda x: x.get("finished_at") or x.get("mtime") or 0, reverse=True)
+        self._library_cache = (now, items)
+        return {"items": items, "total_size": sum(i["size"] for i in items)}
+
+    def _describe_dir(self, model_dir: Path) -> dict | None:
+        try:
+            entries = list(os.scandir(model_dir))
+        except OSError:
+            return None
+        size = count = partial = 0
+        mtime = 0.0
+        for entry in entries:
+            try:
+                if entry.is_file():
+                    if entry.name == META_NAME:
+                        continue
+                    st = entry.stat()
+                    size += st.st_size
+                    if entry.name.endswith(INCOMPLETE_SUFFIX):
+                        partial += st.st_size
+                    else:
+                        count += 1
+                    mtime = max(mtime, st.st_mtime)
+                elif entry.is_dir():
+                    for sub in os.scandir(entry.path):
+                        if not sub.is_file():
+                            continue
+                        st = sub.stat()
+                        size += st.st_size
+                        if sub.name.endswith(INCOMPLETE_SUFFIX):
+                            partial += st.st_size
+                        else:
+                            count += 1
+                        mtime = max(mtime, st.st_mtime)
+            except OSError:
+                continue
+
+        meta = {}
+        meta_path = model_dir / META_NAME
+        if meta_path.exists():
+            try:
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                meta = {}
+        if count == 0 and partial == 0:
+            return None
+        return {
+            "path": str(model_dir),
+            "name": model_dir.name,
+            "repo_id": meta.get("repo_id") or "",
+            "revision": meta.get("revision") or "main",
+            "size": size,
+            "files": count,
+            "partial_size": partial,
+            "finished_at": meta.get("finished_at"),
+            "mtime": mtime,
+            "complete": bool(meta),
+        }
