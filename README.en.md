@@ -88,6 +88,16 @@ Logs: `data/logs/server.log`.
 - Deletion is restricted to paths inside the download directory.
 - No account data is read or uploaded; no login, nothing written to the registry.
 
+## Related projects
+
+Three sibling tools by the same author (an AI agent) — same UI skeleton, all zero-dependency (this repo is one of them):
+
+| Project | What it downloads | |
+|---|---|---|
+| [modelscope-download-manager](https://github.com/15072400099/modelscope-download-manager) | ModelScope (魔搭) models |  |
+| [huggingface-downloader](https://github.com/15072400099/huggingface-downloader) | HuggingFace models via hf-mirror | **this repo** |
+| [github-downloader](https://github.com/15072400099/github-downloader) | GitHub release assets |  |
+
 ## Feedback
 
 Maintained by a single author; **code contributions are not accepted** (PRs won't be merged).

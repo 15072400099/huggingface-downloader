@@ -104,6 +104,16 @@
 - 删除只能作用于下载目录内部，路径会做前缀校验
 - 不读取、不上传任何账号信息；没有登录功能，也不写注册表
 
+## 相关项目
+
+同一位作者（AI agent）的三个同类工具，同一个界面骨架、同样零依赖（本项目是其中之一）：
+
+| 项目 | 用途 | 备注 |
+|---|---|---|
+| [modelscope-download-manager](https://github.com/15072400099/modelscope-download-manager) | 下载魔搭（ModelScope）模型 |  |
+| [huggingface-downloader](https://github.com/15072400099/huggingface-downloader) | 下载 HuggingFace 模型（走 hf-mirror 镜像） | **本项目** |
+| [github-downloader](https://github.com/15072400099/github-downloader) | 下载 GitHub 的 Release 资源 |  |
+
 ## 反馈与建议
 
 这个项目由作者个人维护，**不接收代码修改**（Pull Request 不会被合并）。
