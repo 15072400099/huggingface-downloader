@@ -28,7 +28,7 @@ _lock = threading.RLock()
 _cache: dict[tuple, tuple[float, object]] = {}
 _CACHE_TTL = 60.0
 
-settings: dict = {"endpoint": DEFAULT_ENDPOINT, "proxy": ""}
+settings: dict = {"endpoint": DEFAULT_ENDPOINT, "proxy": "off"}
 
 
 def configure(cfg: dict) -> None:
@@ -42,8 +42,39 @@ def endpoint() -> str:
     return settings.get("endpoint") or DEFAULT_ENDPOINT
 
 
+def system_proxy() -> str:
+    """读 Windows 的系统代理设置。"""
+    try:
+        import winreg
+
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+        )
+        enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
+        server, _ = winreg.QueryValueEx(key, "ProxyServer")
+        if enabled and server:
+            first = str(server).split(";")[0]
+            if "=" in first:
+                first = first.split("=", 1)[1]
+            first = first.strip()
+            if first and "://" not in first:
+                first = "http://" + first
+            return first
+    except Exception:
+        pass
+    return ""
+
+
 def proxy() -> str:
-    return (settings.get("proxy") or "").strip()
+    """代理设置：off/空 = 直连；auto = 跟随系统代理；其它按填写的地址。"""
+    raw = (settings.get("proxy") or "off").strip()
+    low = raw.lower()
+    if low in ("", "off", "none", "0", "false"):
+        return ""
+    if low == "auto":
+        return system_proxy()
+    return raw
 
 
 def _get_json(url: str, params: dict | None = None, timeout: int = 45):
@@ -85,7 +116,8 @@ def explain_error(exc: BaseException) -> str:
     if "ssl" in low or "tls" in low:
         return "TLS 握手失败，这个地址可能被网络拦截了，换服务地址试试"
     if "curl 失败" in text:
-        return f"网络请求失败：{text[:160]}"
+        return ("网络请求失败。如果这里是镜像地址，说明直连被阻断了——"
+                "去设置里把代理改成 auto 或填上你的代理地址再试")
     if "不是 json" in text:
         return "这个地址返回的不是模型数据，可能不是 HuggingFace 镜像"
     return f"{type(exc).__name__}: {text[:200]}"

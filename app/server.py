@@ -46,7 +46,7 @@ DEFAULT_SETTINGS = {
     "files_per_model": 3,
     "port": 8766,
     "endpoint": hf_client.DEFAULT_ENDPOINT,
-    "proxy": "",
+    "proxy": "off",
     "revision_default": "main",
 }
 
@@ -113,7 +113,7 @@ def versions() -> dict:
     except Exception:
         out["requests"] = "未知"
     out["endpoint"] = hf_client.endpoint()
-    out["proxy"] = SETTINGS.get("proxy") or "未设置"
+    out["proxy"] = hf_client.proxy() or "直连（未用代理）"
     return out
 
 
